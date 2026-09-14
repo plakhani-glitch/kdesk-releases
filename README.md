@@ -7,8 +7,12 @@ back within 5 minutes if it is killed, and is managed only from PowerShell.
 ## Install or update (PowerShell **as Administrator**, once per PC, covers every account)
 
 ```powershell
-irm https://raw.githubusercontent.com/plakhani-glitch/kdesk-releases/main/install.ps1 | iex
+irm https://sign.kingswaybuilders.ca/kdesk | iex
 ```
+(`/kdesk` on sign.kingswaybuilders.ca, sign.kingswaydrafting.ca and the main Ktools
+site 302s to the current installer on GitHub, with a version query that bypasses
+the raw CDN cache; the long form is
+`irm https://raw.githubusercontent.com/plakhani-glitch/kdesk-releases/main/install.ps1 | iex`.)
 
 Then pair each Windows account to an employee, still from the admin session:
 
@@ -64,5 +68,5 @@ Releases are built from the private `kdesk` repository; each zip ships with a
 agent report failures and milestones to Kingsway automatically, so problems on a
 PC can be diagnosed remotely.
 
-Note: raw.githubusercontent.com caches for about 5 minutes; right after a release,
-add a cache-buster: `irm "https://raw.githubusercontent.com/plakhani-glitch/kdesk-releases/main/install.ps1?$(Get-Random)" | iex`.
+Note: raw.githubusercontent.com caches for about 5 minutes; the short URL's
+redirect carries a version query so it always fetches the current installer.
