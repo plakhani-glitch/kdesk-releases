@@ -162,21 +162,34 @@ try {
   Set-Content -LiteralPath $haveFile -Value "$want  $Asset" -Encoding ASCII
   L 'app folder swapped'
 
-  # 5. agent task: re-register from the template the new build ships, so a
-  #    changed task definition travels with the update
-  $tpl = Join-Path $App 'app\resources\task-machine.xml'
-  if (Test-Path -LiteralPath $tpl) {
-    $exePath = Join-Path $App 'app\KingswayDesk.exe'
-    $esc = { param($s) $s.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;') }
-    $xml = (Get-Content -LiteralPath $tpl -Raw).Replace('__EXE__', (& $esc $exePath)).Replace('__APPDIR__', (& $esc (Split-Path $exePath -Parent)))
-    $tx = Join-Path $tmp 'KingswayDesk.xml'
-    [IO.File]::WriteAllText($tx, $xml, [Text.Encoding]::Unicode)
-    $r = Invoke-Native 'schtasks.exe' @('/Create', '/F', '/TN', 'KingswayDesk', '/XML', $tx)
-    L ("agent task re-registered: exit {0} {1}" -f $r.Code, (($r.Out | Select-Object -First 2) -join ' '))
+  # 5. bring the agents back in EVERY signed-in session. Two mechanisms:
+  #    - The Scheduler's RestartOnFailure restarts the instances we just killed
+  #      (exit code 1) within a minute — as long as the task was NOT re-registered
+  #      (re-registering forgets the killed instances; that left Lyca's PC with no
+  #      agent at all after the 20:56 update on 2026-09-13).
+  #    - Belt: from SYSTEM, start the agent directly inside each interactive
+  #      session with a throw-away interactive task per signed-in user.
+  $exePath = Join-Path $App 'app\KingswayDesk.exe'
+  $users = @()
+  try { foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name = 'explorer.exe'" -ErrorAction Stop)) { try { $o = ($p | Invoke-CimMethod -MethodName GetOwner); if ($o.User) { $users += ("{0}\{1}" -f $o.Domain, $o.User) } } catch {} } } catch {}
+  $users = @($users | Sort-Object -Unique)
+  L ("signed-in sessions: {0}" -f ($(if ($users.Count) { $users -join ', ' } else { 'none' })))
+  Start-Sleep -Seconds 3
+  foreach ($u in $users) {
+    $tn = 'KingswayDesk-start-' + ($u -replace '[^A-Za-z0-9]', '_')
+    try {
+      $action = New-ScheduledTaskAction -Execute $exePath -Argument '--launchd' -WorkingDirectory (Split-Path $exePath -Parent)
+      $principal = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited
+      $settings = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
+      Register-ScheduledTask -TaskName $tn -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+      Start-ScheduledTask -TaskName $tn
+      L "started agent in session of $u"
+    } catch { L ("could not start agent for {0}: {1}" -f $u, $_.Exception.Message) }
   }
-
-  # 6. bring agents back: the Scheduler restarts killed instances (RestartOnFailure)
-  #    and unlock/logon triggers cover the rest; /Run kicks the console session now
+  Start-Sleep -Seconds 8
+  foreach ($u in $users) { $tn = 'KingswayDesk-start-' + ($u -replace '[^A-Za-z0-9]', '_'); try { Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue } catch {} }
+  $running = @(Get-Process -Name 'KingswayDesk' -ErrorAction SilentlyContinue).Count
+  L "agent processes running after update: $running"
   $r = Invoke-Native 'schtasks.exe' @('/Run', '/TN', 'KingswayDesk'); L ("schtasks /Run: exit {0}" -f $r.Code)
   Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
   L "UPDATED to $($want.Substring(0, 12))"
