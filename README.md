@@ -4,26 +4,33 @@ Headless activity agent for Kingsway employee PCs. No tray icon, no window,
 no Start-menu or Startup-apps entry. It starts at every sign-in, is brought
 back within 5 minutes if it is killed, and is managed only from PowerShell.
 
-## Install or update (PowerShell, signed in as the employee, no admin rights)
+## Install or update (PowerShell **as Administrator**, once per PC, covers every account)
 
 ```powershell
 irm https://raw.githubusercontent.com/plakhani-glitch/kdesk-releases/main/install.ps1 | iex
 ```
 
-The installer asks for a pairing code. The employee gets one from
-**Ktools → Drafting → Connect Desktop → Generate code** (valid 10 minutes).
-To pair without the prompt:
+Then pair each Windows account to an employee, still from the admin session:
 
-```powershell
-$env:KDESK_CODE = 'ABCD-1234'; irm https://raw.githubusercontent.com/plakhani-glitch/kdesk-releases/main/install.ps1 | iex
-```
+1. Ktools → Drafting → Connect Desktop → **Code for a team member** → pick the employee → copy the code.
+2. `kdesk assign <WindowsAccount> ABCD-1234`
+
+The pairing is applied the moment that account signs in (or immediately if it
+is signed in already). The installer offers this step at the end; `kdesk users`
+shows every account, whether its agent is running and who it reports as.
+
+Run without elevation, the same line installs for the current account only and
+asks for that account's own code (`$env:KDESK_CODE = 'ABCD-1234'` to skip the prompt).
 
 ## Manage
 
 | Command | PIN | What it does |
 |---|---|---|
-| `kdesk status` | | running? connected as who? last sample, pending uploads, tasks |
-| `kdesk pair ABCD-1234` | | connect this PC |
+| `kdesk status` | | running? connected as who? last sample, pending uploads, task |
+| `kdesk users` | | every Windows account: signed in? agent running? reporting as who? |
+| `kdesk assign <WinUser> ABCD-1234` | admin | pair a Windows account to an employee before they sign in |
+| `kdesk assignments` | admin | list the pre-made pairings |
+| `kdesk pair ABCD-1234` | | connect the agent running in this session |
 | `kdesk today` | yes | what is being tracked right now and hours today by app |
 | `kdesk pause` / `kdesk resume` | yes | stop / restart tracking |
 | `kdesk sync` | yes | upload pending activity now |
@@ -36,17 +43,21 @@ $env:KDESK_CODE = 'ABCD-1234'; irm https://raw.githubusercontent.com/plakhani-gl
 | `kdesk update` | | install the latest release, keeps the pairing |
 | `kdesk uninstall` | yes | remove everything |
 
-The PIN is the owner's 6-digit administrator PIN, verified by Ktools; wrong
-attempts are rate-limited, logged and emailed to the owner.
+Add `-User <WindowsAccount>` to aim `status`, `today`, `pause`, `resume`, `sync`,
+`log` … at another signed-in account (admin). The PIN is the owner's 6-digit
+administrator PIN, verified by Ktools; wrong attempts are rate-limited, logged
+and emailed to the owner.
 
 ## How it stays running
 
-Two hidden Task Scheduler tasks, registered by the agent itself:
-`KingswayDesk` (at logon, restarts on failure, no execution time limit) and
-`KingswayDeskWatchdog` (every 5 minutes, starts the agent if it is not running).
-The agent re-creates them if they are removed. Files live in
-`%LOCALAPPDATA%\KingswayDesk` (app, log, `kdesk` command) and
-`%APPDATA%\Kingsway Desk` (state).
+One hidden Task Scheduler task, `KingswayDesk`, with the **Users group** as
+principal: Windows starts one agent inside every account's session at sign-in
+and after unlock/reconnect, restarts it within a minute if it is killed, and no
+standard user can edit or remove it. App and `kdesk` live in
+`C:\Program Files\KingswayDesk` (admin-owned), pairings in
+`C:\ProgramData\KingswayDesk\assign` (each file readable only by its account),
+per-account state in that account's `%APPDATA%\Kingsway Desk`, logs in
+`%LOCALAPPDATA%\KingswayDesk\logs`.
 
 Releases are built from the private `kdesk` repository; each zip ships with a
 `.sha256` the installer verifies before unpacking.

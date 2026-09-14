@@ -10,7 +10,11 @@
   Kingsway (Ktools) verifies server-side, rate-limits, logs and emails.
 
   kdesk status                 is it running, connected as who, last sample, pending uploads
-  kdesk pair ABCD-1234         connect this PC (code from Ktools > Drafting > Connect Desktop)
+  kdesk users                  every Windows account on this PC: agent running? connected as who?
+  kdesk assign <WinUser> CODE  (admin) pair a Windows account to an employee BEFORE they sign in;
+                               the code comes from Ktools > Drafting > Connect Desktop > Code for a team member
+  kdesk assignments            (admin) list the pre-made pairings
+  kdesk pair ABCD-1234         connect the agent running in THIS session (employee's own code)
   kdesk today            PIN   what is being tracked right now + hours today by app
   kdesk pause | resume   PIN   stop / restart tracking (stays paused until resumed)
   kdesk sync             PIN   upload pending activity now
@@ -24,12 +28,18 @@
   kdesk update                 install the latest release from GitHub (keeps the pairing)
   kdesk uninstall        PIN   remove the agent, its tasks, its data and this command
 
+  Add -User <WinUser> to aim status/today/pause/... at another signed-in account (admin).
   Add -Pin 123456 to skip the prompt, -Json for machine-readable status.
+
+  Machine-wide install (installer run as Administrator): app in C:\Program Files\KingswayDesk,
+  one hidden Task Scheduler task with the Users group as principal, so Windows starts one agent
+  inside EVERY account's session at sign-in / unlock. Per-user install: this account only.
 #>
 param(
   [Parameter(Position = 0)] [string] $Command = 'help',
   [Parameter(Position = 1, ValueFromRemainingArguments = $true)] [string[]] $Rest,
   [string] $Pin,
+  [string] $User,
   [switch] $Force,
   [switch] $Json
 )
@@ -40,8 +50,22 @@ $ProgressPreference = 'SilentlyContinue'
 if (-not $Rest) { $Rest = @() }
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 
-$Root        = Join-Path $env:LOCALAPPDATA 'KingswayDesk'
-$AppDir      = Join-Path $Root 'app'
+# Where things live. MACHINE install: app under Program Files (admin-owned),
+# shared data under ProgramData. Per-user runtime files (control.json, log,
+# state) are always in the signed-in user's own profile, so -User <WinUser>
+# simply points at another profile (needs admin rights to read it).
+# ($env:ProgramData / ProgramFiles always exist on Windows; the fallbacks only let the script run in tests elsewhere.)
+$MachineDir  = Join-Path $(if ($env:ProgramData) { $env:ProgramData } else { [IO.Path]::GetTempPath() }) 'KingswayDesk-ProgramData'
+$MachineApp  = Join-Path $(if ($env:ProgramFiles) { $env:ProgramFiles } else { [IO.Path]::GetTempPath() }) 'KingswayDesk'
+if ($env:ProgramData) { $MachineDir = Join-Path $env:ProgramData 'KingswayDesk' }
+$IsMachine   = Test-Path -LiteralPath (Join-Path $MachineDir 'machine.json')
+$ProfileRoot = if ($User) {
+  $prof = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.LocalPath -and (Split-Path $_.LocalPath -Leaf) -ieq $User } | Select-Object -First 1
+  if ($prof) { $prof.LocalPath } else { Join-Path (Split-Path $env:USERPROFILE -Parent) $User }
+} else { $env:USERPROFILE }
+$LocalAppData = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $env:HOME '.kdesk' }
+$Root        = if ($User) { Join-Path $ProfileRoot 'AppData\Local\KingswayDesk' } else { Join-Path $LocalAppData 'KingswayDesk' }
+$AppDir      = if ($IsMachine) { Join-Path $MachineApp 'app' } else { Join-Path (Join-Path $LocalAppData 'KingswayDesk') 'app' }
 $Exe         = Join-Path $AppDir 'KingswayDesk.exe'
 $ControlFile = Join-Path $Root 'control.json'
 $LogFile     = Join-Path $Root 'logs\desk.log'
@@ -49,6 +73,8 @@ $TaskName    = 'KingswayDesk'
 $Watchdog    = 'KingswayDeskWatchdog'
 $DistRepo    = if ($env:KDESK_REPO) { $env:KDESK_REPO } else { 'plakhani-glitch/kdesk-releases' }
 $RawBase     = "https://raw.githubusercontent.com/$DistRepo/main"
+$PairUrl     = 'https://us-central1-kingsway-internal-tools.cloudfunctions.net/desktopPair'
+$IsAdmin     = try { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { $false }
 
 # ---- output helpers ----
 function Write-Head([string]$t) { Write-Host ''; Write-Host $t -ForegroundColor Cyan }
@@ -85,7 +111,16 @@ function Invoke-Native([string]$exe, [string[]]$argv) {
 }
 
 # ---- agent control channel ----
-function Get-AgentProcess { Get-Process -Name 'KingswayDesk' -ErrorAction SilentlyContinue }
+function Get-AgentProcess {
+  $all = @(Get-Process -Name 'KingswayDesk' -ErrorAction SilentlyContinue)
+  if (-not $User -or -not $all.Count) { return $all }
+  # Only that account's instance (needs admin to see other users' processes).
+  $owned = @()
+  foreach ($p in $all) {
+    try { $o = (Get-CimInstance Win32_Process -Filter "ProcessId = $($p.Id)" | Invoke-CimMethod -MethodName GetOwner).User; if ($o -ieq $User) { $owned += $p } } catch {}
+  }
+  return $owned
+}
 function Get-Control {
   if (-not (Test-Path -LiteralPath $ControlFile)) { return $null }
   try { $c = Get-Content -LiteralPath $ControlFile -Raw | ConvertFrom-Json } catch { return $null }
@@ -162,7 +197,104 @@ function Wait-Agent([int]$seconds = 30) {
 function Show-Tasks {
   if ($env:OS -ne 'Windows_NT') { return }
   Write-Row 'Logon task' (Get-TaskState $TaskName)
-  Write-Row 'Watchdog task' (Get-TaskState $Watchdog)
+  if (-not $IsMachine) { Write-Row 'Watchdog task' (Get-TaskState $Watchdog) }
+}
+function Require-Admin([string]$what) {
+  if (-not $IsAdmin) { throw "$what needs an Administrator PowerShell (right-click PowerShell > Run as administrator)." }
+}
+# ---- machine-wide: pre-made pairings per Windows account ----
+function Get-LocalAccounts {
+  # Interactive accounts on this PC (local + any domain profiles that have signed in).
+  $names = @()
+  try { $names += @(Get-LocalUser -ErrorAction Stop | Where-Object { $_.Enabled } | ForEach-Object { $_.Name }) } catch {}
+  try { $names += @(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object { -not $_.Special -and $_.LocalPath } | ForEach-Object { Split-Path $_.LocalPath -Leaf }) } catch {}
+  return @($names | Where-Object { $_ } | Sort-Object -Unique)
+}
+function Get-LoggedOnUsers {
+  # Owner of each explorer.exe = each interactive session.
+  $out = @()
+  try {
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name = 'explorer.exe'" -ErrorAction Stop)) {
+      try { $o = ($p | Invoke-CimMethod -MethodName GetOwner).User; if ($o) { $out += $o } } catch {}
+    }
+  } catch {}
+  return @($out | Sort-Object -Unique)
+}
+function Do-Assign {
+  Require-Admin 'kdesk assign'
+  if (-not $IsMachine) { throw 'assign is for the machine-wide install. Run the installer as Administrator first.' }
+  $target = if ($Rest.Count -ge 1) { "$($Rest[0])" } else { Read-Host '  Windows account name (as shown at the sign-in screen)' }
+  $code = if ($Rest.Count -ge 2) { ($Rest[1..($Rest.Count - 1)] -join '') } else { Read-Host "  Pairing code for $target (Ktools > Drafting > Connect Desktop > Code for a team member)" }
+  $code = ($code -replace '[^A-Za-z0-9]', '').ToUpper()
+  if (-not $target) { throw 'Which Windows account?' }
+  if ($code.Length -ne 8) { throw 'A pairing code is 8 letters/digits, e.g. ABCD-1234.' }
+  $known = Get-LocalAccounts
+  if ($known.Count -and -not ($known -contains $target)) { Write-Note ("'{0}' is not a known account here (known: {1}). Continuing anyway." -f $target, ($known -join ', ')) }
+  # Redeem the code now (single use, 10 min) so the token is ready when they sign in.
+  $body = [Text.Encoding]::UTF8.GetBytes((@{ code = $code; deviceName = "$env:COMPUTERNAME ($target) (windows)"; platform = 'windows' } | ConvertTo-Json -Compress))
+  try {
+    $r = Invoke-RestMethod -Method POST -Uri $PairUrl -ContentType 'application/json; charset=utf-8' -Body $body -TimeoutSec 45
+  } catch {
+    $msg = if ($_.ErrorDetails -and $_.ErrorDetails.Message) { try { ($_.ErrorDetails.Message | ConvertFrom-Json).error } catch { $_.ErrorDetails.Message } } else { $_.Exception.Message }
+    throw "Kingsway rejected the code: $msg"
+  }
+  if (-not $r.token) { throw 'Pairing failed (no token returned).' }
+  $dir = Join-Path $MachineDir 'assign'
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $file = Join-Path $dir "$target.json"
+  $doc = @{ email = $r.email; name = $r.name; deviceId = $r.deviceId; token = $r.token; at = [int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()); assignedBy = $env:USERNAME; windowsUser = $target }
+  [IO.File]::WriteAllText($file, ($doc | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding $false))
+  # Only that account (plus SYSTEM and Administrators) may read the token.
+  $acl = Invoke-Native 'icacls.exe' @($file, '/inheritance:r', '/grant:r', 'SYSTEM:F', '/grant:r', 'Administrators:F', '/grant:r', "${target}:R")
+  if ($acl.Code -ne 0) { Write-Note ("icacls: {0}" -f ($acl.Out -join ' ')) }
+  Write-Ok ("{0} -> {1} <{2}> (device {3})" -f $target, $r.name, $r.email, $r.deviceId)
+  # If that account is signed in right now, tell its agent to pick it up immediately.
+  $their = Join-Path (Join-Path (Split-Path $env:USERPROFILE -Parent) $target) 'AppData\Local\KingswayDesk\control.json'
+  $prof = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.LocalPath -and (Split-Path $_.LocalPath -Leaf) -ieq $target } | Select-Object -First 1
+  if ($prof) { $their = Join-Path $prof.LocalPath 'AppData\Local\KingswayDesk\control.json' }
+  if (Test-Path -LiteralPath $their) {
+    try {
+      $c = Get-Content -LiteralPath $their -Raw | ConvertFrom-Json
+      if (Get-Process -Id $c.pid -ErrorAction SilentlyContinue) {
+        $res = Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$($c.port)/adopt" -Headers @{ Authorization = "Bearer $($c.secret)" } -ContentType 'application/json' -Body '{}' -TimeoutSec 20
+        Write-Ok ("Their agent is signed in now: {0}" -f $res.result)
+      } else { Write-Host '  They are not signed in; the agent adopts it at their next sign-in.' }
+    } catch { Write-Note "Could not reach their running agent ($($_.Exception.Message)); it adopts the pairing within 5 minutes or at next sign-in." }
+  } else { Write-Host '  Applied at their next sign-in (or within 5 minutes if their agent is already running).' }
+}
+function Show-Assignments {
+  Require-Admin 'kdesk assignments'
+  $dir = Join-Path $MachineDir 'assign'
+  if (-not (Test-Path -LiteralPath $dir)) { Write-Note 'No assignments yet. kdesk assign <WinUser> ABCD-1234'; return }
+  Write-Head 'Pre-made pairings (Windows account -> employee)'
+  foreach ($f in Get-ChildItem -LiteralPath $dir -Filter '*.json') {
+    try { $d = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json; Write-Row $f.BaseName ("{0} <{1}>  assigned {2} by {3}" -f $d.name, $d.email, (Fmt-Ago $d.at), $d.assignedBy) } catch { Write-Row $f.BaseName 'unreadable' }
+  }
+}
+function Show-Users {
+  Write-Head 'Windows accounts on this PC'
+  $logged = Get-LoggedOnUsers
+  $assignDir = Join-Path $MachineDir 'assign'
+  foreach ($name in Get-LocalAccounts) {
+    $line = ''
+    $on = $logged -contains $name
+    $prof = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.LocalPath -and (Split-Path $_.LocalPath -Leaf) -ieq $name } | Select-Object -First 1
+    $cf = if ($prof) { Join-Path $prof.LocalPath 'AppData\Local\KingswayDesk\control.json' } else { $null }
+    $agent = 'agent not running'
+    if ($cf -and (Test-Path -LiteralPath $cf)) {
+      try {
+        $c = Get-Content -LiteralPath $cf -Raw | ConvertFrom-Json
+        if (Get-Process -Id $c.pid -ErrorAction SilentlyContinue) {
+          $st = Invoke-RestMethod -Method GET -Uri "http://127.0.0.1:$($c.port)/status" -Headers @{ Authorization = "Bearer $($c.secret)" } -TimeoutSec 10
+          $agent = if ($st.paired) { "agent running, connected as $($st.device.name) <$($st.device.email)>, $($st.sampleState)" } else { 'agent running, NOT connected' }
+        }
+      } catch { $agent = "agent running, no access ($($_.Exception.Message))" }
+    }
+    $assigned = ''
+    if (Test-Path -LiteralPath (Join-Path $assignDir "$name.json")) { try { $d = Get-Content -LiteralPath (Join-Path $assignDir "$name.json") -Raw | ConvertFrom-Json; $assigned = " | assigned -> $($d.email)" } catch {} }
+    Write-Row $name (("{0} | {1}{2}" -f $(if ($on) { 'signed in' } else { 'signed out' }), $agent, $assigned))
+  }
+  if (-not $IsAdmin) { Write-Note 'Run as Administrator to see other accounts'' agents.' }
 }
 function Show-Status {
   if (-not (Get-Control)) {
@@ -176,8 +308,9 @@ function Show-Status {
   }
   $s = Invoke-Agent 'GET' '/status'
   if ($Json) { $s | ConvertTo-Json -Depth 6; return }
-  Write-Head 'Kingsway Desk'
+  Write-Head ("Kingsway Desk - Windows account {0}" -f $(if ($s.user) { $s.user } elseif ($User) { $User } else { $env:USERNAME }))
   Write-Row 'Agent' ('v{0}  pid {1}  up {2}' -f $s.version, $s.pid, (Fmt-Dur $s.uptimeSeconds))
+  Write-Row 'Install' ($(if ($s.machineInstall) { 'machine-wide (every account on this PC)' } else { 'this account only' }))
   if ($s.paired) { Write-Row 'Connected as' ('{0} <{1}>' -f $s.device.name, $s.device.email) }
   else { Write-Note 'NOT connected. Run: kdesk pair ABCD-1234  (code from Ktools > Drafting > Connect Desktop)' }
   $state = if (-not $s.enabled) { 'PAUSED by administrator (kdesk resume)' }
@@ -232,11 +365,14 @@ function Do-Pair {
 function Do-Start {
   if (Get-Control) { Write-Ok 'Already running'; return }
   if (-not (Test-Path -LiteralPath $Exe)) { throw "Not installed ($Exe missing). Run the installer again: kdesk update" }
+  if ($User) { throw "Start it from that account's own session (sign in as $User, or lock/unlock: the task starts it)." }
   $r = Invoke-Native 'schtasks.exe' @('/Run', '/TN', $TaskName)
   if ($r.Code -ne 0) {
-    Write-Note "Task Scheduler could not start it ($($r.Out -join ' ')). Re-registering the tasks..."
+    Write-Note "Task Scheduler could not start it ($($r.Out -join ' ')). Re-registering the task..."
+    if ($IsMachine) { Require-Admin 'Re-registering the machine-wide task' }
     # Unsupervised launch of the packaged exe = installer mode: rewrites the tasks, starts the supervised copy, exits.
-    $p = Start-Process -FilePath $Exe -PassThru -Wait
+    $args = @(); if ($IsMachine) { $args = @('--machine') }
+    $p = if ($args.Count) { Start-Process -FilePath $Exe -ArgumentList $args -PassThru -Wait } else { Start-Process -FilePath $Exe -PassThru -Wait }
     if ($p.ExitCode -ne 0) { Write-Note "installer step exit code $($p.ExitCode) - see kdesk log" }
   }
   Wait-Agent
@@ -254,22 +390,38 @@ function Do-Log {
   Get-Content -LiteralPath $LogFile -Tail $n
 }
 function Do-Update {
+  if ($IsMachine) { Require-Admin 'kdesk update (machine-wide install)' }
   Write-Head "Updating from github.com/$DistRepo ..."
   $script = Invoke-RestMethod -Uri "$RawBase/install.ps1?nocache=$(Get-Random)" -TimeoutSec 60
   Invoke-Expression $script
 }
 function Do-Uninstall {
   Write-Head 'Uninstall Kingsway Desk'
+  if ($IsMachine) { Require-Admin 'kdesk uninstall (machine-wide install)' }
   if (Get-Control) { $null = Invoke-Admin 'status'; Write-Ok 'PIN accepted' }
-  elseif (-not $Force) { throw 'The agent is not running, so the PIN cannot be checked. Run kdesk start first, or add -Force.' }
+  elseif (-not $Force) { throw 'The agent is not running in this session, so the PIN cannot be checked. Run kdesk start first, or add -Force.' }
   foreach ($t in @($TaskName, $Watchdog)) {
     $r = Invoke-Native 'schtasks.exe' @('/Delete', '/F', '/TN', $t)
-    if ($r.Code -eq 0) { Write-Ok "Removed task $t" } else { Write-Note "Task ${t}: $($r.Out -join ' ')" }
+    if ($r.Code -eq 0) { Write-Ok "Removed task $t" } elseif ($t -eq $TaskName) { Write-Note "Task ${t}: $($r.Out -join ' ')" }
   }
-  Get-AgentProcess | Stop-Process -Force -ErrorAction SilentlyContinue
+  # All sessions' agents (admin) or just ours.
+  Get-Process -Name 'KingswayDesk' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
   Start-Sleep -Seconds 1
   foreach ($n in @('electron.app.Kingsway Desk', 'Kingsway Desk', 'KingswayDesk')) {
     Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name $n -ErrorAction SilentlyContinue
+  }
+  if ($IsMachine) {
+    Remove-Item -LiteralPath $MachineDir -Recurse -Force -ErrorAction SilentlyContinue
+    # Every account's state + runtime files.
+    foreach ($prof in @(Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { -not $_.Special -and $_.LocalPath })) {
+      Remove-Item -LiteralPath (Join-Path $prof.LocalPath 'AppData\Roaming\Kingsway Desk') -Recurse -Force -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath (Join-Path $prof.LocalPath 'AppData\Local\KingswayDesk') -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $m = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    if ($m) { [Environment]::SetEnvironmentVariable('Path', ((@($m -split ';') | Where-Object { $_ -and ($_.TrimEnd('\') -ne $MachineApp) }) -join ';'), 'Machine') }
+    Write-Ok 'Kingsway Desk removed for every account on this PC. Revoke the devices in Ktools > Drafting > Connect Desktop if they are still listed.'
+    Start-Process -FilePath 'cmd.exe' -ArgumentList "/c timeout /t 2 /nobreak >nul & rmdir /s /q `"$MachineApp`"" -WindowStyle Hidden
+    return
   }
   Remove-Item -LiteralPath $AppDir -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath (Join-Path $env:APPDATA 'Kingsway Desk') -Recurse -Force -ErrorAction SilentlyContinue
@@ -279,7 +431,7 @@ function Do-Uninstall {
     $new = (@($u -split ';') | Where-Object { $_ -and ($_.TrimEnd('\') -ne $Root) }) -join ';'
     [Environment]::SetEnvironmentVariable('Path', $new, 'User')
   }
-  Write-Ok 'Kingsway Desk removed from this PC. If the device is still listed in Ktools > Drafting > Connect Desktop, revoke it there.'
+  Write-Ok 'Kingsway Desk removed from this account. If the device is still listed in Ktools > Drafting > Connect Desktop, revoke it there.'
   # Delete the folder holding this very script after we exit.
   Start-Process -FilePath 'cmd.exe' -ArgumentList "/c timeout /t 2 /nobreak >nul & rmdir /s /q `"$Root`"" -WindowStyle Hidden
 }
@@ -308,6 +460,9 @@ try {
       $s = Invoke-Admin 'set-excluded' (, $list)
       Write-Ok ('Excluded apps: {0}' -f (@($s.settings.excludedApps) -join ', '))
     }
+    'users'      { Show-Users }
+    'assign'     { Do-Assign }
+    'assignments' { Show-Assignments }
     'start'      { Do-Start }
     'restart'    { Do-Restart }
     'log'        { Do-Log }
