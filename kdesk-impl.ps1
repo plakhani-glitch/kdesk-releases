@@ -25,6 +25,8 @@
   kdesk start                  start the agent if it is not running
   kdesk restart                kill the agent and start it again
   kdesk log [lines]            tail the agent log
+  kdesk report                 send the full picture to Kingsway (task history, permissions, every
+                               account's agent log) so problems can be diagnosed remotely
   kdesk update                 install the latest release from GitHub (keeps the pairing)
   kdesk uninstall        PIN   remove the agent, its tasks, its data and this command
 
@@ -278,6 +280,56 @@ function Show-Assignments {
     try { $d = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json; Write-Row $f.BaseName ("{0} <{1}>  assigned {2} by {3}" -f $d.name, $d.email, (Fmt-Ago $d.at), $d.assignedBy) } catch { Write-Row $f.BaseName 'unreadable' }
   }
 }
+# Task Scheduler's verbose CSV: columns are positional (names are localized).
+# 0 HostName, 1 TaskName, 2 Next Run Time, 3 Status, 4 Logon Mode, 5 Last Run Time, 6 Last Result
+function Get-TaskLastRun([string]$name) {
+  $r = Invoke-Native 'schtasks.exe' @('/Query', '/TN', $name, '/V', '/FO', 'CSV', '/NH')
+  if ($r.Code -ne 0) { return $null }
+  $line = $r.Out | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1
+  if (-not $line) { return $null }
+  $cols = ($line -split '","') | ForEach-Object { $_.Trim('"') }
+  if ($cols.Count -lt 7) { return $null }
+  return @{ Status = $cols[3]; LastRun = $cols[5]; LastResult = $cols[6] }
+}
+function Get-ProfilePaths {
+  @(Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { -not $_.Special -and $_.LocalPath } | ForEach-Object { $_.LocalPath })
+}
+function Send-Report {
+  $parts = New-Object System.Collections.Generic.List[string]
+  $add = { param($title, $text) $parts.Add("=== $title ===`n$text") | Out-Null }
+  & $add 'env' ("host={0} user={1} admin={2} machine={3} ps={4} os={5}" -f $env:COMPUTERNAME, $env:USERNAME, $IsAdmin, $IsMachine, $PSVersionTable.PSVersion, [Environment]::OSVersion.VersionString)
+  & $add 'logged on (explorer owners)' ((Get-LoggedOnUsers) -join ', ')
+  & $add 'local accounts' ((Get-LocalAccounts) -join ', ')
+  $q = Invoke-Native 'schtasks.exe' @('/Query', '/TN', $TaskName, '/V', '/FO', 'LIST'); & $add "schtasks $TaskName (exit $($q.Code))" (($q.Out | Select-Object -First 60) -join "`n")
+  $x = Invoke-Native 'schtasks.exe' @('/Query', '/TN', $TaskName, '/XML'); & $add 'task xml' (($x.Out -join "`n").Substring(0, [Math]::Min(3000, ($x.Out -join "`n").Length)))
+  if (Test-Path -LiteralPath $Exe) { $a = Invoke-Native 'icacls.exe' @($Exe); & $add 'icacls exe' ($a.Out -join "`n") } else { & $add 'exe' "MISSING: $Exe" }
+  foreach ($f in @((Join-Path $MachineDir 'machine.json'), (Join-Path $Root 'install.json'))) { if (Test-Path -LiteralPath $f) { & $add $f (Get-Content -LiteralPath $f -Raw) } }
+  $assignDir = Join-Path $MachineDir 'assign'
+  if (Test-Path -LiteralPath $assignDir) {
+    $rows = foreach ($f in Get-ChildItem -LiteralPath $assignDir -Filter '*.json') { try { $d = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json; "{0} -> {1} (device {2}, {3})" -f $f.BaseName, $d.email, $d.deviceId, (Fmt-Ago $d.at) } catch { "$($f.BaseName): unreadable" } }
+    & $add 'assignments' ($rows -join "`n")
+    $a2 = Invoke-Native 'icacls.exe' @($assignDir, '/T'); & $add 'icacls assign' (($a2.Out | Select-Object -First 30) -join "`n")
+  }
+  foreach ($prof in Get-ProfilePaths) {
+    $name = Split-Path $prof -Leaf
+    $lf = Join-Path $prof 'AppData\Local\KingswayDesk\logs\desk.log'
+    $cf = Join-Path $prof 'AppData\Local\KingswayDesk\control.json'
+    $st = Join-Path $prof 'AppData\Roaming\Kingsway Desk\kdesk-state.json'
+    $line = "log={0} control={1} state={2}" -f (Test-Path -LiteralPath $lf), (Test-Path -LiteralPath $cf), (Test-Path -LiteralPath $st)
+    if (Test-Path -LiteralPath $cf) { try { $c = Get-Content -LiteralPath $cf -Raw | ConvertFrom-Json; $line += " pid=$($c.pid) alive=$([bool](Get-Process -Id $c.pid -ErrorAction SilentlyContinue)) v=$($c.version)" } catch {} }
+    if (Test-Path -LiteralPath $st) { try { $d = (Get-Content -LiteralPath $st -Raw | ConvertFrom-Json).device; if ($d) { $line += " paired=$($d.email)" } else { $line += ' paired=no' } } catch {} }
+    & $add "account $name" $line
+    if (Test-Path -LiteralPath $lf) { try { & $add "log $name (tail)" (@(Get-Content -LiteralPath $lf -Tail 25) -join "`n") } catch {} }
+  }
+  $detail = ($parts -join "`n`n")
+  if ($detail.Length -gt 29000) { $detail = $detail.Substring(0, 29000) + "`n[truncated]" }
+  $body = @{ kind = 'kdesk'; level = 'info'; stage = 'report'; message = "kdesk report from $env:COMPUTERNAME by $env:USERNAME"; detail = $detail
+             host = $env:COMPUTERNAME; user = $env:USERNAME; machine = [bool]$IsMachine
+             os = ('{0} | PS {1} | admin={2}' -f [Environment]::OSVersion.VersionString, $PSVersionTable.PSVersion, $IsAdmin) }
+  $bytes = [Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json -Compress -Depth 5))
+  Invoke-RestMethod -Method POST -Uri 'https://us-central1-kingsway-internal-tools.cloudfunctions.net/desktopDiag' -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 30 | Out-Null
+  Write-Ok ("Report sent ({0} KB). Kingsway can read it now." -f [math]::Round($detail.Length / 1024))
+}
 function Show-Users {
   Write-Head 'Windows accounts on this PC'
   $logged = Get-LoggedOnUsers
@@ -301,6 +353,8 @@ function Show-Users {
     if (Test-Path -LiteralPath (Join-Path $assignDir "$name.json")) { try { $d = Get-Content -LiteralPath (Join-Path $assignDir "$name.json") -Raw | ConvertFrom-Json; $assigned = " | assigned -> $($d.email)" } catch {} }
     Write-Row $name (("{0} | {1}{2}" -f $(if ($on) { 'signed in' } else { 'signed out' }), $agent, $assigned))
   }
+  $lr = Get-TaskLastRun $TaskName
+  if ($lr) { Write-Row 'Task' ("{0}, last run {1}, result {2}" -f $lr.Status, $lr.LastRun, $lr.LastResult) }
   if (-not $IsAdmin) { Write-Note 'Run as Administrator to see other accounts'' agents.' }
 }
 function Show-Status {
@@ -470,6 +524,7 @@ try {
       Write-Ok ('Excluded apps: {0}' -f (@($s.settings.excludedApps) -join ', '))
     }
     'users'      { Show-Users }
+    'report'     { Send-Report }
     'assign'     { Do-Assign }
     'assignments' { Show-Assignments }
     'start'      { Do-Start }

@@ -154,6 +154,14 @@ function Install-KingswayDesk {
   if (Test-Path -LiteralPath $AppDir) { throw "Could not replace $AppDir (a file is still in use). Sign out and in, then run the installer again." }
   Move-Item -LiteralPath $found.Directory.FullName -Destination $AppDir
   Get-ChildItem -LiteralPath $AppDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
+  if ($Machine) {
+    # A MOVE keeps the source ACL: files that came from this admin's %TEMP% are
+    # readable by this admin only, and every other account's agent would fail to
+    # start with Access denied. Reset to inherit Program Files' permissions
+    # (Users: read + execute, Administrators: full).
+    $r = Invoke-Native 'icacls.exe' @($Root, '/reset', '/T', '/C', '/Q')
+    if ($r.Code -ne 0) { Warn ("icacls reset: {0}" -f ($r.Out -join ' ')) } else { Ok 'Permissions: every account can run it, only administrators can change it' }
+  }
   Ok 'Files in place'
 
   Step 'Installing the kdesk command'
@@ -222,7 +230,7 @@ function Install-KingswayDesk {
     Write-Host '    you can always do it later with:  kdesk assign <WindowsAccount> ABCD-1234'
     $accounts = @()
     try { $accounts = @(Get-LocalUser -ErrorAction Stop | Where-Object { $_.Enabled } | ForEach-Object { $_.Name }) } catch {}
-    if ($accounts.Count) { Write-Host ("    Accounts on this PC: {0}" -f ($accounts -join ', ')) }
+    if ($accounts.Count) { Write-Host ("    Accounts on this PC: {0}" -f ($accounts -join ', ')); Note ("accounts: {0}" -f ($accounts -join ', ')) }
     while ($true) {
       Write-Host ''
       $acct = Read-Host '    Windows account (Enter to finish)'
