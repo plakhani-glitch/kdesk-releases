@@ -27,7 +27,7 @@
   kdesk log [lines]            tail the agent log
   kdesk report                 send the full picture to Kingsway (task history, permissions, every
                                account's agent log) so problems can be diagnosed remotely
-  kdesk update                 install the latest release from GitHub (keeps the pairing)
+  kdesk update                 check GitHub for a newer release now (updates arrive by themselves when Kingsway publishes)
   kdesk uninstall        PIN   remove the agent, its tasks, its data and this command
 
   Add -User <WinUser> to aim status/today/pause/... at another signed-in account (admin).
@@ -303,7 +303,9 @@ function Send-Report {
   $q = Invoke-Native 'schtasks.exe' @('/Query', '/TN', $TaskName, '/V', '/FO', 'LIST'); & $add "schtasks $TaskName (exit $($q.Code))" (($q.Out | Select-Object -First 60) -join "`n")
   $x = Invoke-Native 'schtasks.exe' @('/Query', '/TN', $TaskName, '/XML'); & $add 'task xml' (($x.Out -join "`n").Substring(0, [Math]::Min(3000, ($x.Out -join "`n").Length)))
   if (Test-Path -LiteralPath $Exe) { $a = Invoke-Native 'icacls.exe' @($Exe); & $add 'icacls exe' ($a.Out -join "`n") } else { & $add 'exe' "MISSING: $Exe" }
-  foreach ($f in @((Join-Path $MachineDir 'machine.json'), (Join-Path $Root 'install.json'))) { if (Test-Path -LiteralPath $f) { & $add $f (Get-Content -LiteralPath $f -Raw) } }
+  foreach ($f in @((Join-Path $MachineDir 'machine.json'), (Join-Path $MachineDir 'installed.sha256'), (Join-Path $Root 'install.json'))) { if (Test-Path -LiteralPath $f) { & $add $f (Get-Content -LiteralPath $f -Raw) } }
+  $uq = Invoke-Native 'schtasks.exe' @('/Query', '/TN', 'KingswayDeskUpdater', '/V', '/FO', 'LIST'); & $add "schtasks KingswayDeskUpdater (exit $($uq.Code))" (($uq.Out | Select-Object -First 40) -join "`n")
+  $ul = Join-Path $MachineDir 'updater.log'; if (Test-Path -LiteralPath $ul) { & $add 'updater.log (tail)' (@(Get-Content -LiteralPath $ul -Tail 30) -join "`n") }
   $assignDir = Join-Path $MachineDir 'assign'
   if (Test-Path -LiteralPath $assignDir) {
     $rows = foreach ($f in Get-ChildItem -LiteralPath $assignDir -Filter '*.json') { try { $d = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json; "{0} -> {1} (device {2}, {3})" -f $f.BaseName, $d.email, $d.deviceId, (Fmt-Ago $d.at) } catch { "$($f.BaseName): unreadable" } }
@@ -354,7 +356,13 @@ function Show-Users {
     Write-Row $name (("{0} | {1}{2}" -f $(if ($on) { 'signed in' } else { 'signed out' }), $agent, $assigned))
   }
   $lr = Get-TaskLastRun $TaskName
-  if ($lr) { Write-Row 'Task' ("{0}, last run {1}, result {2}" -f $lr.Status, $lr.LastRun, $lr.LastResult) }
+  if ($lr) { Write-Row 'Agent task' ("{0}, last run {1}, result {2}" -f $lr.Status, $lr.LastRun, $lr.LastResult) }
+  if ($IsMachine) {
+    $ur = Get-TaskLastRun 'KingswayDeskUpdater'
+    if ($ur) { Write-Row 'Updater task' ("{0}, last run {1}, result {2}" -f $ur.Status, $ur.LastRun, $ur.LastResult) } else { Write-Note 'Updater task MISSING: run the installer line once as Administrator' }
+    $ul = Join-Path $MachineDir 'updater.log'
+    if (Test-Path -LiteralPath $ul) { Write-Row 'Updater log' ((Get-Content -LiteralPath $ul -Tail 1) -join '') }
+  }
   if (-not $IsAdmin) { Write-Note 'Run as Administrator to see other accounts'' agents.' }
 }
 function Show-Status {
@@ -451,7 +459,15 @@ function Do-Log {
   Get-Content -LiteralPath $LogFile -Tail $n
 }
 function Do-Update {
-  if ($IsMachine) { Require-Admin 'kdesk update (machine-wide install)' }
+  if ($IsMachine) {
+    Require-Admin 'kdesk update (machine-wide install)'
+    # Same code the SYSTEM task runs every 30 minutes, just now and in front of you.
+    $u = Join-Path $MachineApp 'updater.ps1'
+    if (-not (Test-Path -LiteralPath $u)) { throw "No updater at $u. Run the installer line once as Administrator." }
+    Write-Head 'Checking github.com for a newer release...'
+    & ([scriptblock]::Create((Get-Content -Raw -LiteralPath $u)))
+    return
+  }
   Write-Head "Updating from github.com/$DistRepo ..."
   $script = try { Invoke-RestMethod -Uri "https://github.com/$DistRepo/releases/latest/download/install.ps1" -TimeoutSec 60 }
             catch { Invoke-RestMethod -Uri "$RawBase/install.ps1?nocache=$(Get-Random)" -TimeoutSec 60 }
@@ -462,7 +478,7 @@ function Do-Uninstall {
   if ($IsMachine) { Require-Admin 'kdesk uninstall (machine-wide install)' }
   if (Get-Control) { $null = Invoke-Admin 'status'; Write-Ok 'PIN accepted' }
   elseif (-not $Force) { throw 'The agent is not running in this session, so the PIN cannot be checked. Run kdesk start first, or add -Force.' }
-  foreach ($t in @($TaskName, $Watchdog)) {
+  foreach ($t in @($TaskName, $Watchdog, 'KingswayDeskUpdater')) {
     $r = Invoke-Native 'schtasks.exe' @('/Delete', '/F', '/TN', $t)
     if ($r.Code -eq 0) { Write-Ok "Removed task $t" } elseif ($t -eq $TaskName) { Write-Note "Task ${t}: $($r.Out -join ' ')" }
   }

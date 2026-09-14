@@ -168,7 +168,8 @@ function Install-KingswayDesk {
   # raw.githubusercontent.com caches for ~5 minutes; always fetch the current shim.
   # From the release assets (fresh; raw.githubusercontent.com caches for 5 min), raw as fallback.
   # NB: "${f}?" - PowerShell would read "$f?" as a variable named f? (empty) and build a bogus URL.
-  foreach ($f in 'kdesk-impl.ps1', 'kdesk.cmd') {
+  $scriptFiles = @('kdesk-impl.ps1', 'kdesk.cmd'); if ($Machine) { $scriptFiles += 'updater.ps1' }
+  foreach ($f in $scriptFiles) {
     try { Invoke-WebRequest -UseBasicParsing -Uri "$Base/$f" -OutFile (Join-Path $Root $f) }
     catch { Invoke-WebRequest -UseBasicParsing -Uri "$Raw/${f}?nocache=$(Get-Random)" -OutFile (Join-Path $Root $f) }
   }
@@ -220,6 +221,74 @@ function Install-KingswayDesk {
   }
 
   if ($Machine) {
+    Step 'Installing the auto-updater (SYSTEM task; fires when Kingsway publishes, plus at boot and daily)'
+    Set-Content -LiteralPath (Join-Path $MachineDir 'installed.sha256') -Value "$want  $Asset" -Encoding ASCII
+    # Event source the (standard-user) agents raise to say "a new release is out".
+    # Creating the source needs admin, which we are; writing events later does not.
+    $ev = Invoke-Native 'eventcreate.exe' @('/ID', '100', '/L', 'APPLICATION', '/T', 'INFORMATION', '/SO', 'KingswayDesk', '/D', 'Kingsway Desk installed')
+    if ($ev.Code -ne 0) { Warn ("event source: {0}" -f ($ev.Out -join ' ')) } else { Ok 'Update event source registered (Application log, KingswayDesk/100)' }
+    $updater = Join-Path $Root 'updater.ps1'
+    $cmdText = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "&amp; ([scriptblock]::Create((Get-Content -Raw -LiteralPath ''' + $updater + ''')))"'
+    $uxml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>Kingsway</Author>
+    <Description>Kingsway Desk auto-updater. Managed by Kingsway. Do not disable.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <EventTrigger><Enabled>true</Enabled><Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="Application"&gt;&lt;Select Path="Application"&gt;*[System[Provider[@Name='KingswayDesk'] and EventID=100]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription></EventTrigger>
+    <BootTrigger><Enabled>true</Enabled><Delay>PT3M</Delay></BootTrigger>
+    <TimeTrigger><Repetition><Interval>P1D</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>2024-01-01T04:00:00</StartBoundary><Enabled>true</Enabled></TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <DisallowStartOnRemoteAppSession>false</DisallowStartOnRemoteAppSession>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>$cmdText</Arguments>
+      <WorkingDirectory>$Root</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"@
+    $ux = Join-Path $Tmp 'KingswayDeskUpdater.xml'
+    [IO.File]::WriteAllText($ux, $uxml, [Text.Encoding]::Unicode)
+    $r = Invoke-Native 'schtasks.exe' @('/Create', '/F', '/TN', 'KingswayDeskUpdater', '/XML', $ux)
+    if ($r.Code -ne 0) { Warn ("Updater task: {0}" -f ($r.Out -join ' ')) }
+    else {
+      Ok 'Task KingswayDeskUpdater registered (SYSTEM; on publish event, at boot, daily 04:00)'
+      $r2 = Invoke-Native 'schtasks.exe' @('/Run', '/TN', 'KingswayDeskUpdater')
+      Start-Sleep -Seconds 6
+      $ul = Join-Path $MachineDir 'updater.log'
+      if (Test-Path -LiteralPath $ul) { Ok ("Updater test run: {0}" -f ((Get-Content -LiteralPath $ul -Tail 1) -join '')) } else { Warn 'Updater ran but wrote no log yet (it will on its next run)' }
+    }
+
     Step 'Pairing the Windows accounts on this PC to employees'
     $existing = @(Get-ChildItem -LiteralPath (Join-Path $MachineDir 'assign') -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName })
     if ($existing.Count) { Ok ("Already assigned: {0} (kept)" -f ($existing -join ', ')) }
@@ -263,6 +332,7 @@ function Install-KingswayDesk {
   Write-Host '  Visible to employees    : nothing (no tray icon, window, Start-menu or Startup entry)'
   if ($Machine) {
     Write-Host '  Covers                  : every account on this PC; starts at each sign-in and after unlock, restarts if killed'
+  Write-Host '  Updates                 : automatic when Kingsway publishes (agents signal a SYSTEM task); nothing to rerun, ever'
     Write-Host '  Manage from PowerShell  : kdesk users | assign | status -User <acct> | today -User <acct> | pause | log | update | uninstall'
   } else {
     Write-Host '  Covers                  : this account only; starts at sign-in, brought back within 5 minutes if killed'
