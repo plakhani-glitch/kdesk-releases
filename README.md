@@ -44,13 +44,20 @@ asks for that account's own code (`$env:KDESK_CODE = 'ABCD-1234'` to skip the pr
 | `kdesk disconnect` | yes | forget the pairing |
 | `kdesk start` / `kdesk restart` | | start, or kill and start |
 | `kdesk log [lines]` | | tail the agent log |
-| `kdesk update` | | install the latest release, keeps the pairing |
+| `kdesk update` | admin | check for a newer release now (updates arrive by themselves when Kingsway publishes) |
 | `kdesk uninstall` | yes | remove everything |
 
 Add `-User <WindowsAccount>` to aim `status`, `today`, `pause`, `resume`, `sync`,
 `log` … at another signed-in account (admin). The PIN is the owner's 6-digit
 administrator PIN, verified by Ktools; wrong attempts are rate-limited, logged
 and emailed to the owner.
+
+## Updates
+
+Automatic. When Kingsway publishes a release, every PC's agent learns it within
+seconds through its normal uploads and hands the update to a hidden system task,
+which swaps the app and restarts the agents. Nobody touches the PC. Off or idle
+PCs catch up at boot or once a day.
 
 ## How it stays running
 

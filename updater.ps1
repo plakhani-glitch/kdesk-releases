@@ -44,6 +44,66 @@ function Send-Diag([string]$level, [string]$message) {
 New-Item -ItemType Directory -Force -Path $Data | Out-Null
 try { $lf = Get-Item -LiteralPath $Log -ErrorAction SilentlyContinue; if ($lf -and $lf.Length -gt 1MB) { Move-Item -LiteralPath $Log -Destination "$Log.1" -Force } } catch {}
 
+# ---- maintenance, every run (also when already up to date) ----
+# 1. Pairing files must be readable by the accounts that adopt them. Fixes PCs
+#    installed by 0.5.0, whose per-name grant could land on the wrong principal.
+try {
+  $assign = Join-Path $Data 'assign'
+  if (Test-Path -LiteralPath $assign) {
+    $null = Invoke-Native 'icacls.exe' @($assign, '/inheritance:r', '/grant:r', 'SYSTEM:(OI)(CI)F', '/grant:r', 'Administrators:(OI)(CI)F', '/grant:r', 'Users:(OI)(CI)RX')
+    $r = Invoke-Native 'icacls.exe' @($assign, '/reset', '/T', '/C', '/Q')
+    $null = Invoke-Native 'icacls.exe' @($assign, '/inheritance:r', '/grant:r', 'SYSTEM:(OI)(CI)F', '/grant:r', 'Administrators:(OI)(CI)F', '/grant:r', 'Users:(OI)(CI)RX')
+    if ($r.Code -ne 0) { L ("assign ACL: {0}" -f ($r.Out -join ' ')) }
+  }
+} catch { L "assign ACL maintenance failed: $($_.Exception.Message)" }
+# 2. This task's own definition travels with the script: re-register when it
+#    lacks the logon trigger (so a PC with no paired agent still checks at sign-in).
+try {
+  $q = Invoke-Native 'schtasks.exe' @('/Query', '/TN', 'KingswayDeskUpdater', '/XML')
+  $cur = $q.Out -join "`n"
+  if ($q.Code -eq 0 -and $cur -notmatch '<LogonTrigger>') {
+    $me = Join-Path $App 'updater.ps1'
+    $cmdText = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "&amp; ([scriptblock]::Create((Get-Content -Raw -LiteralPath ''' + $me + ''')))"'
+    $uxml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Author>Kingsway</Author><Description>Kingsway Desk auto-updater. Managed by Kingsway. Do not disable.</Description></RegistrationInfo>
+  <Triggers>
+    <EventTrigger><Enabled>true</Enabled><Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="Application"&gt;&lt;Select Path="Application"&gt;*[System[Provider[@Name='KingswayDesk'] and EventID=100]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription></EventTrigger>
+    <BootTrigger><Enabled>true</Enabled><Delay>PT3M</Delay></BootTrigger>
+    <LogonTrigger><Enabled>true</Enabled><Delay>PT2M</Delay></LogonTrigger>
+    <TimeTrigger><Repetition><Interval>P1D</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>2024-01-01T04:00:00</StartBoundary><Enabled>true</Enabled></TimeTrigger>
+  </Triggers>
+  <Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <DisallowStartOnRemoteAppSession>false</DisallowStartOnRemoteAppSession>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>powershell.exe</Command><Arguments>$cmdText</Arguments><WorkingDirectory>$App</WorkingDirectory></Exec></Actions>
+</Task>
+"@
+    $ux = Join-Path $Data 'KingswayDeskUpdater.xml'
+    [IO.File]::WriteAllText($ux, $uxml, [Text.Encoding]::Unicode)
+    $r = Invoke-Native 'schtasks.exe' @('/Create', '/F', '/TN', 'KingswayDeskUpdater', '/XML', $ux)
+    L ("updater task re-registered with logon trigger: exit {0}" -f $r.Code)
+    Remove-Item -LiteralPath $ux -Force -ErrorAction SilentlyContinue
+  }
+} catch { L "updater task maintenance failed: $($_.Exception.Message)" }
+
 try {
   $want = ((Invoke-RestMethod -Uri "$Base/$Asset.sha256" -TimeoutSec 60) -split '\s+')[0].ToLower()
   if ($want.Length -ne 64) { throw "Published checksum looks wrong: '$want'" }

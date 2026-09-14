@@ -189,8 +189,10 @@ function Install-KingswayDesk {
     Step 'Preparing the shared folder for per-account pairings'
     $assign = Join-Path $MachineDir 'assign'
     New-Item -ItemType Directory -Force -Path $assign | Out-Null
-    # Users may list the folder; each pairing file gets its own read grant for its account only.
-    $acl = Invoke-Native 'icacls.exe' @($assign, '/inheritance:r', '/grant:r', 'SYSTEM:(OI)(CI)F', '/grant:r', 'Administrators:(OI)(CI)F', '/grant:r', 'Users:(RX)')
+    # Every signed-in account can read the pairings (see kdesk assign for why not per-name grants).
+    $acl = Invoke-Native 'icacls.exe' @($assign, '/inheritance:r', '/grant:r', 'SYSTEM:(OI)(CI)F', '/grant:r', 'Administrators:(OI)(CI)F', '/grant:r', 'Users:(OI)(CI)RX')
+    $null = Invoke-Native 'icacls.exe' @($assign, '/reset', '/T', '/C', '/Q')
+    $null = Invoke-Native 'icacls.exe' @($assign, '/inheritance:r', '/grant:r', 'SYSTEM:(OI)(CI)F', '/grant:r', 'Administrators:(OI)(CI)F', '/grant:r', 'Users:(OI)(CI)RX')
     if ($acl.Code -ne 0) { Warn ("icacls: {0}" -f ($acl.Out -join ' ')) } else { Ok "$assign" }
   }
 

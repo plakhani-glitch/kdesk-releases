@@ -250,12 +250,17 @@ function Do-Assign {
   if (-not $r.token) { throw 'Pairing failed (no token returned).' }
   $dir = Join-Path $MachineDir 'assign'
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  # Readable by every signed-in account on this PC (inherited from the folder).
+  # A per-account grant by NAME was tried first and failed on a PC whose computer
+  # name equals the account name (Windows resolved 'lyca' to the computer LYCA):
+  # the agent could never read its pairing. Employee PCs are single-user, and
+  # the token only lets its holder upload activity as that employee.
+  $acl = Invoke-Native 'icacls.exe' @($dir, '/inheritance:r', '/grant:r', 'SYSTEM:(OI)(CI)F', '/grant:r', 'Administrators:(OI)(CI)F', '/grant:r', 'Users:(OI)(CI)RX')
+  if ($acl.Code -ne 0) { Write-Note ("icacls: {0}" -f ($acl.Out -join ' ')) }
   $file = Join-Path $dir "$target.json"
   $doc = @{ email = $r.email; name = $r.name; deviceId = $r.deviceId; token = $r.token; at = [int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()); assignedBy = $env:USERNAME; windowsUser = $target }
   [IO.File]::WriteAllText($file, ($doc | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding $false))
-  # Only that account (plus SYSTEM and Administrators) may read the token.
-  $acl = Invoke-Native 'icacls.exe' @($file, '/inheritance:r', '/grant:r', 'SYSTEM:F', '/grant:r', 'Administrators:F', '/grant:r', "${target}:R")
-  if ($acl.Code -ne 0) { Write-Note ("icacls: {0}" -f ($acl.Out -join ' ')) }
+  $null = Invoke-Native 'icacls.exe' @($file, '/reset')   # drop any older per-name ACL, inherit from the folder
   Write-Ok ("{0} -> {1} <{2}> (device {3})" -f $target, $r.name, $r.email, $r.deviceId)
   # If that account is signed in right now, tell its agent to pick it up immediately.
   $their = Join-Path (Join-Path (Split-Path $env:USERPROFILE -Parent) $target) 'AppData\Local\KingswayDesk\control.json'
