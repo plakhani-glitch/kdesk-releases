@@ -1,7 +1,8 @@
 # Kingsway Desk for Windows - headless installer.
 #
 #   Run in PowerShell **as Administrator** (right-click PowerShell > Run as administrator):
-#   irm https://raw.githubusercontent.com/plakhani-glitch/kdesk-releases/main/install.ps1 | iex
+#   irm https://sign.kingswaybuilders.ca/kdesk | iex
+#   (= https://github.com/plakhani-glitch/kdesk-releases/releases/latest/download/install.ps1)
 #
 # MACHINE-WIDE (Administrator PowerShell, the normal case): the app goes to
 # C:\Program Files\KingswayDesk (standard users cannot touch it), the `kdesk`
@@ -157,8 +158,12 @@ function Install-KingswayDesk {
 
   Step 'Installing the kdesk command'
   # raw.githubusercontent.com caches for ~5 minutes; always fetch the current shim.
+  # From the release assets (fresh; raw.githubusercontent.com caches for 5 min), raw as fallback.
   # NB: "${f}?" - PowerShell would read "$f?" as a variable named f? (empty) and build a bogus URL.
-foreach ($f in 'kdesk-impl.ps1', 'kdesk.cmd') { Invoke-WebRequest -UseBasicParsing -Uri "$Raw/${f}?nocache=$(Get-Random)" -OutFile (Join-Path $Root $f) }
+  foreach ($f in 'kdesk-impl.ps1', 'kdesk.cmd') {
+    try { Invoke-WebRequest -UseBasicParsing -Uri "$Base/$f" -OutFile (Join-Path $Root $f) }
+    catch { Invoke-WebRequest -UseBasicParsing -Uri "$Raw/${f}?nocache=$(Get-Random)" -OutFile (Join-Path $Root $f) }
+  }
   # An older release shipped kdesk.ps1 next to the shim; PowerShell prefers .ps1 over .cmd
   # for a bare `kdesk`, and the execution policy then refuses it. Remove it.
   Remove-Item -LiteralPath (Join-Path $Root 'kdesk.ps1') -Force -ErrorAction SilentlyContinue

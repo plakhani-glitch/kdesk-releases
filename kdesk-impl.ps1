@@ -399,7 +399,8 @@ function Do-Log {
 function Do-Update {
   if ($IsMachine) { Require-Admin 'kdesk update (machine-wide install)' }
   Write-Head "Updating from github.com/$DistRepo ..."
-  $script = Invoke-RestMethod -Uri "$RawBase/install.ps1?nocache=$(Get-Random)" -TimeoutSec 60
+  $script = try { Invoke-RestMethod -Uri "https://github.com/$DistRepo/releases/latest/download/install.ps1" -TimeoutSec 60 }
+            catch { Invoke-RestMethod -Uri "$RawBase/install.ps1?nocache=$(Get-Random)" -TimeoutSec 60 }
   Invoke-Expression $script
 }
 function Do-Uninstall {
