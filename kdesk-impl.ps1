@@ -436,7 +436,8 @@ function Do-Uninstall {
   Start-Process -FilePath 'cmd.exe' -ArgumentList "/c timeout /t 2 /nobreak >nul & rmdir /s /q `"$Root`"" -WindowStyle Hidden
 }
 function Show-Help {
-  $lines = @(Get-Content -LiteralPath $PSCommandPath)
+  $me = if ($PSCommandPath) { $PSCommandPath } elseif ($env:KDESK_IMPL) { $env:KDESK_IMPL } else { Join-Path $MachineApp 'kdesk-impl.ps1' }
+  $lines = @(Get-Content -LiteralPath $me)
   $start = ($lines | Select-String -SimpleMatch '.DESCRIPTION' | Select-Object -First 1).LineNumber
   $end = ($lines | Select-String -SimpleMatch '#>' | Select-Object -First 1).LineNumber
   Write-Host ''
@@ -473,5 +474,15 @@ try {
 } catch {
   Write-Host ''
   Write-Bad $_.Exception.Message
+  # Report to Kingsway so failures on a PC can be read remotely (best effort).
+  try {
+    $tail = $null; if (Test-Path -LiteralPath $LogFile) { try { $tail = @(Get-Content -LiteralPath $LogFile -Tail 30) -join "`n" } catch {} }
+    $body = @{ kind = 'kdesk'; level = 'error'; stage = "kdesk $Command"; message = $_.Exception.Message
+               detail = ("args: {0}`n{1}`n--- agent log ---`n{2}" -f ($Rest -join ' '), $_.ScriptStackTrace, $tail)
+               host = $env:COMPUTERNAME; user = $env:USERNAME; machine = [bool]$IsMachine
+               os = ('{0} | PS {1} | admin={2}' -f [Environment]::OSVersion.VersionString, $PSVersionTable.PSVersion, $IsAdmin) }
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json -Compress -Depth 5))
+    Invoke-RestMethod -Method POST -Uri 'https://us-central1-kingsway-internal-tools.cloudfunctions.net/desktopDiag' -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 10 | Out-Null
+  } catch {}
   exit 1
 }

@@ -60,4 +60,9 @@ per-account state in that account's `%APPDATA%\Kingsway Desk`, logs in
 `%LOCALAPPDATA%\KingswayDesk\logs`.
 
 Releases are built from the private `kdesk` repository; each zip ships with a
-`.sha256` the installer verifies before unpacking.
+`.sha256` the installer verifies before unpacking. The installer, `kdesk` and the
+agent report failures and milestones to Kingsway automatically, so problems on a
+PC can be diagnosed remotely.
+
+Note: raw.githubusercontent.com caches for about 5 minutes; right after a release,
+add a cache-buster: `irm "https://raw.githubusercontent.com/plakhani-glitch/kdesk-releases/main/install.ps1?$(Get-Random)" | iex`.
