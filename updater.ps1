@@ -188,9 +188,35 @@ try {
   }
   Start-Sleep -Seconds 8
   foreach ($u in $users) { $tn = 'KingswayDesk-start-' + ($u -replace '[^A-Za-z0-9]', '_'); try { Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue } catch {} }
-  $running = @(Get-Process -Name 'KingswayDesk' -ErrorAction SilentlyContinue).Count
-  L "agent processes running after update: $running"
   $r = Invoke-Native 'schtasks.exe' @('/Run', '/TN', 'KingswayDesk'); L ("schtasks /Run: exit {0}" -f $r.Code)
+  # 6. Verify the new build actually runs. Someone is signed in but no agent is
+  #    alive 90 s later => the release is broken on this PC: put the previous
+  #    app back (app.old) so tracking continues, and report loudly.
+  $running = 0
+  $deadline = (Get-Date).AddSeconds(90)
+  while ((Get-Date) -lt $deadline) { $running = @(Get-Process -Name 'KingswayDesk' -ErrorAction SilentlyContinue).Count; if ($running -gt 0) { break }; Start-Sleep -Seconds 5 }
+  L "agent processes running after update: $running (sessions: $($users.Count))"
+  if ($users.Count -gt 0 -and $running -eq 0 -and (Test-Path -LiteralPath $old)) {
+    L 'ROLLBACK: no agent came up on the new build; restoring the previous app'
+    try {
+      Rename-Item -LiteralPath $live -NewName 'app.bad' -Force
+      Rename-Item -LiteralPath $old -NewName 'app' -Force
+      Set-Content -LiteralPath $haveFile -Value "$have  $Asset (rolled back from $want)" -Encoding ASCII
+      foreach ($u in $users) {
+        $tn = 'KingswayDesk-start-' + ($u -replace '[^A-Za-z0-9]', '_')
+        try {
+          $action = New-ScheduledTaskAction -Execute $exePath -Argument '--launchd' -WorkingDirectory (Split-Path $exePath -Parent)
+          $principal = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited
+          Register-ScheduledTask -TaskName $tn -Action $action -Principal $principal -Force | Out-Null
+          Start-ScheduledTask -TaskName $tn; Start-Sleep -Seconds 6
+          Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+        } catch {}
+      }
+      Send-Diag 'error' "Rolled back: build $($want.Substring(0,12)) started no agent on this PC; previous build restored"
+      try { $mutex.ReleaseMutex() } catch {}
+      exit 1
+    } catch { L "rollback failed: $($_.Exception.Message)" }
+  }
   Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
   L "UPDATED to $($want.Substring(0, 12))"
   Send-Diag 'info' "Auto-updated to zip $($want.Substring(0, 12))"
