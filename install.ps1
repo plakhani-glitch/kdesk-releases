@@ -38,7 +38,10 @@ if ($Machine) {
 $UserRoot = Join-Path $env:LOCALAPPDATA 'KingswayDesk'     # this session's control.json / log
 $AppDir  = Join-Path $Root 'app'
 $Exe     = Join-Path $AppDir 'KingswayDesk.exe'
-$Kdesk   = Join-Path $Root 'kdesk.ps1'
+$KdeskImpl = Join-Path $Root 'kdesk-impl.ps1'
+# Never invoke the .ps1 directly: the default execution policy (Restricted)
+# refuses it. Go through powershell.exe -ExecutionPolicy Bypass, like kdesk.cmd.
+function Kdesk { param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $a) & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $KdeskImpl @a }
 $Tmp     = Join-Path $env:TEMP ('kdesk-install-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $Asset   = 'KingswayDesk-win-x64.zip'
 $Base    = if ($Version) { "https://github.com/$Repo/releases/download/v$Version" } else { "https://github.com/$Repo/releases/latest/download" }
@@ -113,7 +116,10 @@ Get-ChildItem -LiteralPath $AppDir -Recurse -File | Unblock-File -ErrorAction Si
 Ok 'Files in place'
 
 Step 'Installing the kdesk command'
-foreach ($f in 'kdesk.ps1', 'kdesk.cmd') { Invoke-WebRequest -UseBasicParsing -Uri "$Raw/$f" -OutFile (Join-Path $Root $f) }
+foreach ($f in 'kdesk-impl.ps1', 'kdesk.cmd') { Invoke-WebRequest -UseBasicParsing -Uri "$Raw/$f" -OutFile (Join-Path $Root $f) }
+# An older release shipped kdesk.ps1 next to the shim; PowerShell prefers .ps1 over .cmd
+# for a bare `kdesk`, and the execution policy then refuses it. Remove it.
+Remove-Item -LiteralPath (Join-Path $Root 'kdesk.ps1') -Force -ErrorAction SilentlyContinue
 Get-ChildItem -LiteralPath $Root -File | Unblock-File -ErrorAction SilentlyContinue
 $scope = if ($Machine) { 'Machine' } else { 'User' }
 $curPath = [Environment]::GetEnvironmentVariable('Path', $scope)
@@ -135,14 +141,14 @@ if ($Machine) {
 Step $(if ($Machine) { 'Registering the machine-wide task (every account) and starting the agent here' } else { 'Registering the always-on tasks and starting the agent' })
 $p = if ($Machine) { Start-Process -FilePath $Exe -ArgumentList '--machine' -PassThru -Wait } else { Start-Process -FilePath $Exe -PassThru -Wait }
 if ($p.ExitCode -ne 0) {
-  if ($Machine) { & $Kdesk log 30; throw "Task Scheduler refused the machine-wide task (installer exit $($p.ExitCode)). See the log above." }
+  if ($Machine) { Kdesk log 30; throw "Task Scheduler refused the machine-wide task (installer exit $($p.ExitCode)). See the log above." }
   Warn "Installer step exited with code $($p.ExitCode) (Task Scheduler refused; Startup fallback used). Details: kdesk log"
 }
 $deadline = (Get-Date).AddSeconds(45); $live = $null
 while ((Get-Date) -lt $deadline) { $live = Get-LiveControl; if ($live) { break }; Start-Sleep -Milliseconds 700 }
 if (-not $live) {
   Warn 'The agent did not report in within 45 s. Last log lines:'
-  & $Kdesk log 40
+  Kdesk log 40
   throw 'Install incomplete: the agent is not running.'
 }
 Ok "Agent v$($live.version) running in this session (pid $($live.pid))"
@@ -175,7 +181,7 @@ if ($Machine) {
     if (-not $acct) { break }
     $code = Read-Host "    Pairing code for $acct"
     if (-not $code) { continue }
-    & $Kdesk assign $acct $code
+    Kdesk assign $acct $code
   }
 } else {
   Step 'Connecting to Ktools'
@@ -191,7 +197,7 @@ if ($Machine) {
       Write-Host '    Press Enter to skip and pair later with:  kdesk pair ABCD-1234'
       $code = Read-Host '    Pairing code'
     }
-    if ($code) { & $Kdesk pair $code } else { Warn 'Not connected yet. Nothing is recorded until it is paired.' }
+    if ($code) { Kdesk pair $code } else { Warn 'Not connected yet. Nothing is recorded until it is paired.' }
   }
 }
 
