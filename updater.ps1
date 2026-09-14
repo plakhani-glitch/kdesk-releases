@@ -44,6 +44,15 @@ function Send-Diag([string]$level, [string]$message) {
 New-Item -ItemType Directory -Force -Path $Data | Out-Null
 try { $lf = Get-Item -LiteralPath $Log -ErrorAction SilentlyContinue; if ($lf -and $lf.Length -gt 1MB) { Move-Item -LiteralPath $Log -Destination "$Log.1" -Force } } catch {}
 
+# One updater at a time. The SYSTEM task (event / boot / logon / daily) and an
+# administrator's `kdesk update` ran in the same second once, shared a temp
+# folder, and both failed. A machine-wide named mutex serialises them; the
+# second one just leaves (the first does the work).
+$mutex = New-Object System.Threading.Mutex($false, 'Global\KingswayDeskUpdater')
+$gotLock = $false
+try { $gotLock = $mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $gotLock = $true }
+if (-not $gotLock) { L 'another updater run is in progress; leaving it to that one'; exit 0 }
+
 # ---- maintenance, every run (also when already up to date) ----
 # 1. Pairing files must be readable by the accounts that adopt them. Fixes PCs
 #    installed by 0.5.0, whose per-name grant could land on the wrong principal.
@@ -109,12 +118,12 @@ try {
   if ($want.Length -ne 64) { throw "Published checksum looks wrong: '$want'" }
   $haveFile = Join-Path $Data 'installed.sha256'
   $have = if (Test-Path -LiteralPath $haveFile) { ((Get-Content -LiteralPath $haveFile -Raw) -split '\s+')[0].ToLower() } else { '' }
-  if ($want -eq $have) { L "up to date ($($want.Substring(0, 12)))"; exit 0 }
+  if ($want -eq $have) { L "up to date ($($want.Substring(0, 12)))"; try { $mutex.ReleaseMutex() } catch {}; exit 0 }
   L "update available: installed '$have' -> published '$want'"
 
   # 1. download + verify
-  $tmp = Join-Path $Data 'tmp'
-  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+  Get-ChildItem -LiteralPath $Data -Directory -Filter 'tmp*' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-2) } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+  $tmp = Join-Path $Data ('tmp-' + $PID)
   New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   $zip = Join-Path $tmp $Asset
   Invoke-WebRequest -UseBasicParsing -Uri "$Base/$Asset" -OutFile $zip
@@ -172,9 +181,11 @@ try {
   Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
   L "UPDATED to $($want.Substring(0, 12))"
   Send-Diag 'info' "Auto-updated to zip $($want.Substring(0, 12))"
+  try { $mutex.ReleaseMutex() } catch {}
   exit 0
 } catch {
   L "FAILED: $($_.Exception.Message)"
   Send-Diag 'error' "Auto-update failed: $($_.Exception.Message)"
+  try { $mutex.ReleaseMutex() } catch {}
   exit 1
 }
