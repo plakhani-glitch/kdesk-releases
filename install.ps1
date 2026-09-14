@@ -24,6 +24,18 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+# A malformed system proxy setting makes every web call fail with "Invalid URI:
+# Invalid port specified" (or similar) before anything else runs. If the proxy
+# cannot even resolve a URL, go direct. $env:KDESK_NOPROXY=1 forces direct.
+$script:ProxyNote = $null
+try {
+  if ($env:KDESK_NOPROXY) { throw 'forced' }
+  $wp = [Net.WebRequest]::DefaultWebProxy
+  if ($wp) { $null = $wp.GetProxy([Uri]'https://github.com/'); $null = $wp.GetProxy([Uri]'http://127.0.0.1:1/') }
+} catch {
+  [Net.WebRequest]::DefaultWebProxy = New-Object Net.WebProxy
+  $script:ProxyNote = "System proxy unusable ($($_.Exception.Message)); connecting directly."
+}
 
 $Repo    = if ($env:KDESK_REPO) { $env:KDESK_REPO } else { 'plakhani-glitch/kdesk-releases' }
 $Version = $env:KDESK_VERSION
@@ -92,6 +104,10 @@ function Get-AgentStatus($c) {
 function Install-KingswayDesk {
   Write-Host ''
   Write-Host 'Kingsway Desk for Windows' -ForegroundColor White
+  if ($script:ProxyNote) { Warn $script:ProxyNote }
+  # First thing: tell Kingsway the installer is running and in what environment,
+  # so a failure that never reaches the catch block still leaves a trace.
+  Send-Diag 'info' 'start' 'Installer started' (@{ machine = [bool]$Machine; admin = $IsAdmin; arch = $env:PROCESSOR_ARCHITECTURE; proxy = $script:ProxyNote; ps = "$($PSVersionTable.PSVersion)"; edition = $PSVersionTable.PSEdition } | ConvertTo-Json -Compress)
   if ($Machine) {
     Write-Host "Machine-wide headless install on $env:COMPUTERNAME (every account), run by $env:USERNAME"
   } else {

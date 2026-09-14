@@ -49,6 +49,13 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 if (-not $Rest) { $Rest = @() }
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+# Broken system proxy => every web call (even to 127.0.0.1) dies with an
+# "Invalid URI" error. If it cannot resolve a URL, go direct.
+try {
+  if ($env:KDESK_NOPROXY) { throw 'forced' }
+  $wp = [Net.WebRequest]::DefaultWebProxy
+  if ($wp) { $null = $wp.GetProxy([Uri]'https://github.com/'); $null = $wp.GetProxy([Uri]'http://127.0.0.1:1/') }
+} catch { [Net.WebRequest]::DefaultWebProxy = New-Object Net.WebProxy }
 
 # Where things live. MACHINE install: app under Program Files (admin-owned),
 # shared data under ProgramData. Per-user runtime files (control.json, log,
