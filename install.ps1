@@ -157,7 +157,8 @@ function Install-KingswayDesk {
 
   Step 'Installing the kdesk command'
   # raw.githubusercontent.com caches for ~5 minutes; always fetch the current shim.
-  foreach ($f in 'kdesk-impl.ps1', 'kdesk.cmd') { Invoke-WebRequest -UseBasicParsing -Uri "$Raw/$f?nocache=$(Get-Random)" -OutFile (Join-Path $Root $f) }
+  # NB: "${f}?" - PowerShell would read "$f?" as a variable named f? (empty) and build a bogus URL.
+foreach ($f in 'kdesk-impl.ps1', 'kdesk.cmd') { Invoke-WebRequest -UseBasicParsing -Uri "$Raw/${f}?nocache=$(Get-Random)" -OutFile (Join-Path $Root $f) }
   # An older release shipped kdesk.ps1 next to the shim; PowerShell prefers .ps1 over .cmd
   # for a bare `kdesk`, and the execution policy then refuses it. Remove it.
   Remove-Item -LiteralPath (Join-Path $Root 'kdesk.ps1') -Force -ErrorAction SilentlyContinue
